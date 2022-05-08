@@ -32,14 +32,14 @@ args = parser.parse_args()
 
 VIDEO_BIT_RATE = [750, 1200, 1850]  # Kbps
 SUMMARY_DIR = 'train_logs'
-LOG_FILE = 'train_logs/tranin_log'
+LOG_FILE = 'train_logs/tranin_log_'
 
 # QoE arguments
 alpha = 1
 beta = 1.85
 gamma = 1
 theta = 0.5
-ALL_VIDEO_NUM = 20
+ALL_VIDEO_NUM = 20000
 # baseline_QoE = 600  # baseline's QoE
 # TOLERANCE = 0.1  # The tolerance of the QoE decrease
 MIN_QOE = -1e4
@@ -47,7 +47,7 @@ all_cooked_time = []
 all_cooked_bw = []
 
 # For training a3c
-NUM_AGENTS = 1
+NUM_AGENTS = 4
 S_INFO = 7
 S_LEN = 8
 A_DIM = 3
@@ -55,27 +55,25 @@ ACTOR_LR_RATE = 0.00025
 CRITIC_LR_RATE = 0.0015
 MODEL_SAVE_INTERVAL = 100
 NN_MODEL = None
-TRAIN_SEQ_LEN = 1000
+TRAIN_SEQ_LEN = 100
 TRAIN_TRACES = './data/network_traces/mixed/'
 DEFAULT_ID = 0
 DEFAULT_BITRATE = 0
 DEFAULT_SLEEP = 0
 
 b_IN_B = 8
-b_IN_kb = 1000
-# log file
-log_file = open(LOG_FILE + '.txt', 'w')
+b_IN_kb = 1000.0
+ms_IN_s = 1000.0
+
 
 # Random seeds settings
 RANDOM_SEED = 42  # the random seed for user retention
-np.random.seed(RANDOM_SEED)
-seeds = np.random.randint(100, size=(ALL_VIDEO_NUM, 2))
 
-def cul_reward(quality, rebuffer, smooth, price, sleep_time):
+def cul_reward(quality, rebuffer, smooth, waste, sleep_time):
     if sleep_time == 0 :
-        reward = alpha * quality - beta * rebuffer - gamma * smooth - (alpha + theta) * price
+        reward = (alpha - theta) * quality - beta * rebuffer - gamma * smooth - alpha * waste
     else:
-        reward = -1 # Give sleeping a punishment
+        reward = -1 - alpha * waste # Give sleeping a punishment
     return reward
 
 
@@ -85,11 +83,11 @@ def central_agent(net_params_queues, exp_queues):
     assert len(net_params_queues) == NUM_AGENTS
     assert len(exp_queues) == NUM_AGENTS
 
-    logging.basicConfig(filename=LOG_FILE + '_central.txt',
+    logging.basicConfig(filename=LOG_FILE + 'central.txt',
                         filemode='a',
                         level=logging.INFO)
 
-    with tf.Session(config=config) as sess, open(LOG_FILE + '_test', 'wb') as test_log_file:
+    with tf.Session(config=config) as sess, open(LOG_FILE + 'test', 'wb') as test_log_file:
 
         actor = a3c.ActorNetwork(sess,
                                  state_dim=[S_INFO, S_LEN], action_dim=A_DIM,
@@ -228,6 +226,12 @@ def central_agent(net_params_queues, exp_queues):
 
 
 def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue):
+    # log file
+    log_file = open(LOG_FILE + str(agent_id) + '.txt', 'w')
+
+    np.random.seed(RANDOM_SEED - agent_id)
+    seeds = np.random.randint(100, size=(ALL_VIDEO_NUM, 2))
+
     # Initial the environment
     net_env = env.Environment(user_sample_id=agent_id,
                               all_cooked_time=all_cooked_time,
@@ -265,10 +269,8 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
         entropy_record = []
 
         # Print the header line of log file
-        log_file.write("time_stamp\tdown_v\tquality\tsleep\trebuf\treward\tdelay\tplay/down/total\tbuflist\t\t\t\taction_prob\n")
+        log_file.write("time_stamp\tdown_v\tquality\tsleep\trebuf\treward\tdelay\tplay/down/total\tbuflist\t\t\t\twaste\taction_prob\n")
 
-        # sum of wasted bytes for a user
-        sum_wasted_bytes = 0
         QoE = 0
         last_played_chunk = -1  # record the last played chunk
         last_bitrate = DEFAULT_BITRATE
@@ -296,8 +298,15 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
 
             video_size = video_size * b_IN_B / b_IN_kb
 
-            # Update bandwidth wastage
-            sum_wasted_bytes += waste_bytes  # Sum up the bandwidth wastage
+            # Culculate the waste of bitrate
+            waste_bitrate = 0
+            if waste_bytes > 0:
+                #Get the chunk id of user will watch for
+                # Note that this is CANNOT obtained when inferring, here just for culculate reward
+                # max_watch_chunk_id = net_env.user_models[download_video_id - net_env.get_start_video_id()].get_watch_chunk_cnt()
+                # Last downloaded chunk id
+                # download_chunk = net_env.players[download_video_id - net_env.get_start_video_id()].get_chunk_counter()
+                waste_bitrate = waste_bytes * b_IN_B / b_IN_kb # in kbps
 
             # Culculate the step reward
             reward = 0
@@ -311,7 +320,7 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
                 for i in range(download_chunk_num) :
                     bitrate_usage = 100 # It should be the waste of bitrate actually
 
-            reward = cul_reward(quality, rebuf, smooth, bitrate_usage, sleep_time)
+            reward = cul_reward(quality, rebuf, smooth, waste_bitrate, sleep_time)
             r_batch.append(reward)
 
             last_bitrate = bit_rate
@@ -323,7 +332,7 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
                 buffer_list = buffer_list + '+' + str(int(net_env.players[i].get_buffer_size()))
 
             # Get the remaining buffer of playing video
-            buffer_size = net_env.players[0].get_buffer_size()
+            buffer_size = net_env.players[0].get_buffer_size() / ms_IN_s
 
             # Get the user retent rate of current playing video
             usr_time, usr_retent_rate = net_env.players[0].get_user_model()
@@ -347,9 +356,9 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
                 next_chunk_size = [0] * A_DIM
 
             # Print log information of the last action
-            log_file.write(("%09d\t%1d\t%1d\t%4d\t%2d\t%6.1f\t%4d\t%4.1f/%3d/%3d\t%-25s\t" %
+            log_file.write(("%09d\t%1d\t%1d\t%4d\t%2d\t%7.0f\t%4d\t%4.1f/%3d/%3d\t%-25s\t%6.1f\t" %
                             (time_stamp, download_video_id, bit_rate, sleep_time, rebuf, reward, delay,
-                             play_chunk_num, download_chunk_num, total_chunk_num, buffer_list)))
+                             play_chunk_num, download_chunk_num, total_chunk_num, buffer_list, waste_bitrate)))
             log_file.write((" ".join(str(format(i, '.3f')) for i in action_prob[0]) + '\n'))
             log_file.flush()
 
@@ -384,17 +393,18 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
             # dequeue history record
             state = np.roll(state, -1, axis=1)
             # print("---------------------")
-            state[0, -1] = delay / 1000.0 # in s
-            state[1, -1] = rebuf / 1000.0 # in s
+            state[0, -1] = delay / ms_IN_s # in s
+            state[1, -1] = rebuf / ms_IN_s # in s
             state[2, -1] = video_size # in kb
             state[3, -1] = last_bitrate # quality index
-            state[4, -1] = buffer_size / 1000.0 # in s
+            state[4, -1] = buffer_size  # in s
             state[5, :A_DIM] = next_chunk_size # in relative value
             state[5, -1] = 0.0
             state[6, :S_LEN] = input_retent_rate # retent prob of next S_LEN chunk
             # print(state)
+
             # Decide the actions for the next step
-            action_prob = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
+            action_prob, action_value = actor.predict(np.reshape(state, (1, S_INFO, S_LEN)))
             action_cumsum = np.cumsum(action_prob)
             hitcount = np.zeros(A_DIM)
             for i in range(1):
@@ -403,11 +413,35 @@ def work_agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_q
             bit_rate = hitcount.argmax()
             download_video_id = play_video_id
             sleep_time = 0
-            if download_chunk_num == total_chunk_num :
-                sleep_time = 100
+            sleep_time = max(0, buffer_size - action_value) * ms_IN_s
+            if download_chunk_num >= total_chunk_num :
+                sleep_time = (total_chunk_num - play_chunk_num) * ms_IN_s
 
             # Culculate action entropy
             entropy_record.append(a3c.compute_entropy(action_prob[0]))
+
+            # report experience to the coordinator
+            end_of_video = False
+            if len(r_batch) >= TRAIN_SEQ_LEN or end_of_video:
+                exp_queue.put([s_batch[1:],  # ignore the first frame
+                               a_batch[1:],  # since we don't have the
+                               r_batch[1:],  # control over it
+                               end_of_video,
+                               {'entropy': entropy_record}])
+
+                # synchronize the network parameters from the coordinator
+                actor_net_params, critic_net_params = net_params_queue.get()
+                actor.set_network_params(actor_net_params)
+                critic.set_network_params(critic_net_params)
+                # _ = actor.set_entropy_weight()
+                # print(_)
+
+                del s_batch[:]
+                del a_batch[:]
+                del r_batch[:]
+                del entropy_record[:]
+
+                log_file.write('\n')  # so that in the log we know where video ends
 
             # store the state and action into batches
             if play_video_id >= ALL_VIDEO_NUM:
